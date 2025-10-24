@@ -1,24 +1,41 @@
-# Compiled class file
-*.class
+# Compiled Object files, Static Executables, Test Executables and Coverage Profiles.
+*.o
+*.a
+*.exe
+*.test
+*.out
+*test.out
+*cover.out
 
-# Log file
+# Go binaries (often created by 'go build' in the root)
+# If you want to commit your binaries, remove the line below.
+# SwiftScheduler-Go* # Assuming your repo name might be used for binaries
+master
+worker
+
+# Dependency directories (Go Modules)
+# Usually we commit go.mod and go.sum, but not the downloaded dependencies.
+vendor/
+
+# Environment configuration
+.env
+
+# IDEs / Editor specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS Generated Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Log files
 *.log
-
-# BlueJ files
-*.ctxt
-
-# Mobile Tools for Java (J2ME)
-.mtj.tmp/
-
-# Package Files #
-*.jar
-*.war
-*.nar
-*.ear
-*.zip
-*.tar.gz
-*.rar
-
-# virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
-hs_err_pid*
-replay_pid*
+logs/
