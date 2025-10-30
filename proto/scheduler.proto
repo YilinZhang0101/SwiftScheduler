@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package scheduler;
+
+option go_package = "github.com/YilinZhang0101/SwiftScheduler/proto";
+
+// The core service. Workers initiate the connection.
+service SchedulerService {
+  // Bi-directional stream for registration, health/status updates,
+  // and task assignments.
+  rpc Connect(stream WorkerMessage) returns (stream MasterMessage);
+}
+
+// --- Worker -> Master ---
+message WorkerMessage {
+  string worker_id = 1;
+  oneof payload {
+    RegisterRequest register_request = 2; // Sent on startup
+    StatusUpdate status_update = 3;       // Sent on task completion or for heartbeats
+  }
+}
+
+message RegisterRequest {
+  string hostname = 1;
+  int32 max_concurrency = 2; // The max number of tasks this worker can run
+}
+
+message StatusUpdate {
+  int32 active_task_count = 1; // Current number of tasks being processed
+  // In Phase 2, this will be expanded with CPU, p99_latency, etc.
+}
+
+// --- Master -> Worker ---
+message MasterMessage {
+  oneof payload {
+    RegisterResponse register_response = 1; // Confirms registration
+    TaskAssignment task_assignment = 2;   // Pushes a new task to the worker
+  }
+}
+
+message RegisterResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message TaskAssignment {
+  string task_id = 1;
+  string task_name = 2;
+  bytes task_payload = 3; // The serialized task arguments
+}
