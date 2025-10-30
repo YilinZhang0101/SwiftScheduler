@@ -90,14 +90,10 @@ func main() {
 
 	for range ticker.C {
 		log.Println("Sending periodic status update...")
-		updateMsg := &pb.WorkerMessage{
-			WorkerId: workerID,
-			Payload: &pb.WorkerMessage_StatusUpdate{
-				StatusUpdate: &pb.StatusUpdate{ActiveTaskCount: 0},
-			},
-		}
-		if err := stream.Send(updateMsg); err != nil {
-			log.Printf("Failed to send status update: %v", err)
-		}
+		// TODO: Step 3: Send StatusUpdate (including active_task_count)
+		// updateMsg := &pb.WorkerMessage{ ... }
+		// if err := stream.Send(updateMsg); err != nil {
+		//   log.Printf("Failed to send status update: %v", err)
+		// }
 	}
 }
