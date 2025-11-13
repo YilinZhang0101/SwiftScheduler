@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -35,7 +36,10 @@ func main() {
 	}
 
 	// 4. [Send registration] First send RegisterRequest after connection
-	workerID, _ := os.Hostname() // use hostname as workerID
+	hostname, _ := os.Hostname() // use hostname as workerID
+	// add PID to prevent multiple instances of the same worker on the same machine
+	workerID := fmt.Sprintf("%s-%d", hostname, os.Getpid())
+	
 	req := &pb.WorkerMessage{
 		WorkerId: workerID,
 		Payload: &pb.WorkerMessage_RegisterRequest{
@@ -80,20 +84,39 @@ func main() {
 			}
 			// ---
 		}
-	}()
+	}()    // parameter for goroutine
 
 	// 6. [Keep main goroutine alive]
 	// The main goroutine also needs to do work, like sending heartbeats
 	// In Phase 1, simulate StatusUpdate as heartbeat/load report with a ticker
-	ticker := time.NewTicker(10 * time.Second) // every 10 seconds
+	ticker := time.NewTicker(5 * time.Second) // every 5 seconds
 	defer ticker.Stop()
 
 	for range ticker.C {
-		log.Println("Sending periodic status update...")
 		// TODO: Step 3: Send StatusUpdate (including active_task_count)
-		// updateMsg := &pb.WorkerMessage{ ... }
-		// if err := stream.Send(updateMsg); err != nil {
-		//   log.Printf("Failed to send status update: %v", err)
-		// }
+		// set current load
+		currentActiveTasks := int32(0)
+
+		log.Printf("Sending heartbeat... (Active Tasks: %d)", currentActiveTasks)
+
+        // build StatusUpdate message
+        updateMsg := &pb.WorkerMessage{
+            WorkerId: workerID, // reuse the workerID from the beginning
+            Payload: &pb.WorkerMessage_StatusUpdate{
+                StatusUpdate: &pb.StatusUpdate{
+                    ActiveTaskCount: currentActiveTasks,
+                    // TODO: extend CPU/Memory usage here
+                },
+            },
+        }
+
+        // send message
+        if err := stream.Send(updateMsg); err != nil {
+            // if sending fails, it usually means the connection is broken
+            log.Printf("Failed to send status update: %v", err)
+            // in production, this usually triggers the "reconnect logic" (Reconnect)
+            // for now, we can just break or return to exit the program
+            break 
+        }
 	}
 }
