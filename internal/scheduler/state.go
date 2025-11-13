@@ -3,6 +3,7 @@ package scheduler
 import (
 	"log"
 	"sync" // sync for mutexes
+	"errors"
 
 	pb "github.com/YilinZhang0101/SwiftScheduler/proto" // module path
 )
@@ -35,7 +36,7 @@ func NewStateManager() *StateManager {
 }
 
 // RegisterWorker is called when a worker connects
-func (sm *StateManager) RegisterWorker(req *pb.RegisterRequest, workerID string) {
+func (sm *StateManager) RegisterWorker(req *pb.RegisterRequest, workerID string, stream pb.SchedulerService_ConnectServer) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
