@@ -85,6 +85,7 @@ func (s *masterServer) Connect(stream pb.SchedulerService_ConnectServer) error {
 		case *pb.WorkerMessage_StatusUpdate:
 			log.Printf("Received StatusUpdate from %s: ActiveTasks=%d", msg.WorkerId, payload.StatusUpdate.ActiveTaskCount)
 			// TODO: call s.stateManager.UpdateWorkerStatus(...)
+			s.stateManager.UpdateWorkerStatus(msg.WorkerId, payload.StatusUpdate)
 		default:
 			log.Printf("Received unknown message type from %s", msg.WorkerId)
 		}
