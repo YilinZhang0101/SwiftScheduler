@@ -8,10 +8,11 @@
 *cover.out
 
 # Go binaries (often created by 'go build' in the root)
-# If you want to commit your binaries, remove the line below.
+# Ignore only binaries at the repository root (not source dirs under cmd/)
+# If you want to commit your binaries, remove the lines below.
 # SwiftScheduler-Go* # Assuming your repo name might be used for binaries
-master
-worker
+/master
+/worker
 
 # Dependency directories (Go Modules)
 # Usually we commit go.mod and go.sum, but not the downloaded dependencies.
