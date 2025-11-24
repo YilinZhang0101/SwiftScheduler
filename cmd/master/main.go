@@ -40,8 +40,8 @@ func (s *masterServer) Connect(stream pb.SchedulerService_ConnectServer) error {
 	// Use type assertion to verify the payload is a RegisterRequest
 	if req, ok := firstMsg.Payload.(*pb.WorkerMessage_RegisterRequest); ok {
 		workerID = firstMsg.WorkerId
-		// 3. [Register] Add the Worker to the StateManager
-		s.stateManager.RegisterWorker(req.RegisterRequest, workerID)
+		// 3. [Register] Add the Worker to the StateManager, pass the stream
+		s.stateManager.RegisterWorker(req.RegisterRequest, workerID, stream)
 	} else {
 		// If the first message is not a registration, reject the connection
 		log.Printf("Worker from %s sent invalid first message. Disconnecting.", clientAddr)
