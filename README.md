@@ -1,4 +1,4 @@
-# adaptive-grpc-keepalive
+# Adaptive-gRPC-Keepalive
 
 A distributed master-worker system that detects **silent failures (freezes)** significantly faster than static keepalive.
 
