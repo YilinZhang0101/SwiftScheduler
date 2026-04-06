@@ -1,42 +1,62 @@
-# Compiled Object files, Static Executables, Test Executables and Coverage Profiles.
-*.o
-*.a
+# =========================
+# Go binaries
+# =========================
+bin/
 *.exe
-*.test
 *.out
-*test.out
-*cover.out
+*.test
 
-# Go binaries (often created by 'go build' in the root)
-# Ignore only binaries at the repository root (not source dirs under cmd/)
-# If you want to commit your binaries, remove the lines below.
-# SwiftScheduler-Go* # Assuming your repo name might be used for binaries
-/master
-/worker
-
-# Dependency directories (Go Modules)
-# Usually we commit go.mod and go.sum, but not the downloaded dependencies.
+# =========================
+# Go modules
+# =========================
 vendor/
 
-# Environment configuration
+# =========================
+# Scripts
+# =========================
+scripts/
+*.sh
+
+# =========================
+# Experiment outputs
+# =========================
+runs/
+results/
+results_cpu/
+results_freeze/
+results_normal/
+
+# =========================
+# Logs
+# =========================
+logs/
+*.log
+
+# =========================
+# Docs
+# =========================
+docs/
+
+# =========================
+# Environment
+# =========================
 .env
 
-# IDEs / Editor specific files
-.idea/
+# =========================
+# OS files
+# =========================
+.DS_Store
+
+# =========================
+# IDE
+# =========================
 .vscode/
+.idea/
 *.swp
 *.swo
 
-# OS Generated Files
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
-desktop.ini
-
-# Log files
-*.log
-logs/
+# =========================
+# Docker temp
+# =========================
+*.pid
+*.seed

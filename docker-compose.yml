@@ -1,0 +1,52 @@
+version: "3.9"
+
+networks:
+  grpc-net:
+    driver: bridge
+
+services:
+
+  master:
+    build: .
+    image: swiftscheduler
+    container_name: master
+    command: master
+    networks:
+      - grpc-net
+    environment:
+      MASTER_LISTEN_ADDR:      ":50051"
+      MASTER_KA_TIME:          "${MASTER_KA_TIME:-10s}"
+      MASTER_KA_TIMEOUT:       "${MASTER_KA_TIMEOUT:-5s}"
+      MASTER_HB_TIMEOUT:       "${MASTER_HB_TIMEOUT:-15s}"
+      MASTER_HB_SCAN:          "200ms"
+      MASTER_ENABLE_TASKGEN:   "1"
+      MASTER_TASK_TICK:        "2s"    # slow down task generator — default 10ms is too noisy
+      MASTER_TASK_BATCH:       "1"     # one task at a time
+    ports:
+      - "50051:50051"
+
+  worker:
+    image: swiftscheduler
+    container_name: worker
+    command: worker
+    depends_on:
+      - master
+    networks:
+      - grpc-net
+    init: true
+    cap_add:
+      - NET_ADMIN
+    environment:
+      MASTER_ADDR:             "master:50051"
+      WORKER_KA_TIME:          "${WORKER_KA_TIME:-10s}"
+      WORKER_KA_TIMEOUT:       "${WORKER_KA_TIMEOUT:-5s}"
+      WORKER_HEARTBEAT:        "2s"
+      WORKER_MAX_CONCURRENCY:  "10"
+    entrypoint: >
+      sh -c "
+        if [ -n \"$$DELAY_MS\" ] && [ \"$$DELAY_MS\" != '0' ]; then
+          echo '[netem] Injecting delay=$$DELAY_MS ms jitter=$$JITTER_MS ms';
+          tc qdisc add dev eth0 root netem delay $${DELAY_MS}ms $${JITTER_MS:-0}ms distribution normal;
+        fi;
+        exec worker
+      "
