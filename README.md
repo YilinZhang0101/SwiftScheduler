@@ -27,9 +27,36 @@ A distributed master-worker system that detects **silent failures (freezes)** si
 
 ## System Architecture
 ```
-Master <-- gRPC stream --> Workers  
-                ↑  
-Adaptive Keepalive (RFC 6298)
+                +----------------------+
+                |        Master        |
+                |----------------------|
+                |  Connect(stream)     |
+                |  Recv StatusUpdate   |
+                |  Send TaskAssignment |
+                +----------+-----------+
+                           |
+                           | bidirectional gRPC stream
+                           |
+          +----------------+----------------+
+          |                                 |
+          v                                 v
++----------------------+       +----------------------+
+|        Worker        |       |     StateManager     |
+|----------------------|       |----------------------|
+| RegisterRequest      |       | RegisterWorker       |
+| Periodic heartbeat   |-----> | UpdateWorkerStatus   |
+| Execute task         |       | SelectWorker         |
+| Send status update   |       | CheckHeartbeatTimeout|
++----------+-----------+       +----------------------+
+           |
+           | timing samples
+           v
++----------------------+
+|  Adaptive Estimator  |
+|----------------------|
+| SRTT / RTTVAR / RTO  |
+| Recommend KA params  |
++----------------------+
 ```
 
 ## Repository Structure
@@ -78,6 +105,35 @@ docker compose up -d
 # check logs
 docker compose logs -f
 ```
+
+## Scripts (shareable, reproducible)
+
+The `scripts/` directory is intended to be published on GitHub and used by others.
+
+### Dependencies
+
+- `docker` + `docker compose`
+- `bash` (tested with `set -euo pipefail`)
+- `python3` (used for latency parsing and small helper math)
+- **Optional (local-only)**: `lsof` / `pkill` (used by `run_capacity.sh`)
+
+### Experiment runner (Docker-based)
+
+- **`scripts/run_experiment.sh`**: run one failure-detection experiment (crash / freeze), optionally with network delay/jitter injected via `tc netem` inside the worker container.
+- **`scripts/auto_run_freeze.sh`**: batch-run multiple freeze configs and append to a unified CSV.
+
+Examples:
+
+```bash
+./scripts/run_experiment.sh A freeze
+DELAY_MS=100 JITTER_MS=30 ./scripts/run_experiment.sh E freeze
+./scripts/auto_run_freeze.sh
+```
+
+Outputs:
+
+- Logs: `./logs/config_<CONFIG>_<MODE>_<ts>/`
+- Summary CSV (default): `./results/experiment_summary.csv`
 
 ## Failure Detection Model
 

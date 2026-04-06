@@ -14,8 +14,8 @@ vendor/
 # =========================
 # Scripts
 # =========================
-scripts/
-*.sh
+# NOTE: scripts are meant to be published.
+# Keep outputs/logs ignored (see below), but track `scripts/`.
 
 # =========================
 # Experiment outputs
