@@ -1,263 +1,241 @@
-# SwiftScheduler: An Adaptive Distributed Task Scheduler
+# Design: Adaptive gRPC Keepalive for a Master–Worker Runtime
 
-**Author:** Yilin Zhang  
-**Status:** Version 1  
-**Reviewers:** Prof. Yiji Zhang  
-**Date:** October 20, 2025
+**Author:** Yilin (Elaine) Zhang  
+**Status:** Version 1 (aligned with repository `adaptive-grpc-keepalive`, Go module `github.com/YilinZhang0101/adaptive-grpc-keepalive`)  
+**Date:** April 6, 2026
 
 ## 1. Overview
 
-This document proposes the design for **SwiftScheduler**, a new distributed task scheduling system. Its primary goal is to explore a "sweet spot" in the landscape of task schedulers: combining the operational simplicity of lightweight frameworks (like Celery) with the resilience and intelligence of heavyweight, stream-processing platforms (like Flink).
+This system is a **Go-based master–worker distributed runtime** built on **bidirectional gRPC streaming**. The research and engineering focus is **failure detection under crash versus “silent” failures** (for example, process freeze, severe GC pause, or CPU starvation).
 
-### The Core Problem
+**Core observation:** TCP and transport-level teardown often expose **crash failures** quickly. They do **not** reliably expose **silent failures**, where the connection stays open but the peer stops making progress. Operators then rely on **timeouts**—at the transport (gRPC keepalive), the application (heartbeat messages), or both.
 
-The core problem with existing lightweight frameworks is their **"dumb worker" model**, where workers blindly pull tasks from a message broker. This architecture is highly vulnerable to "thundering herd" scenarios (e.g., flash sales), leading to memory exhaustion and cascading system failure.
+**Core tension:**
 
-### The Solution
+- **Aggressive** timeouts → faster detection, but more **false positives** under jitter or host scheduling delay.
+- **Conservative** timeouts → fewer false positives, but **slow** detection of freezes.
 
-SwiftScheduler solves this by introducing a **Master-Worker architecture with a global view**. The Master is the central brain, enabling intelligent flow control and scheduling. The project is divided into two phases:
+This project adds an **adaptive keepalive tuner** on the worker, inspired by **RFC 6298** (Jacobson/Karels smoothed RTT and variance), so keepalive intervals and deadlines track recent timing behavior instead of staying fixed.
 
-- **Phase 1 (6-Week Sprint):** Build the core framework and implement a static, global flow controller. The goal is to scientifically prove that this global-view architecture is fundamentally more resilient than the "no-control" baseline model.
+## Evolution
 
-- **Phase 2 (Future Work):** Inject dynamic, adaptive intelligence into the proven framework, implementing latency-aware scheduling and dynamic backpressure (Path A & Path B).
+v0: static timeout  
+v1: heartbeat-based detection  
+v2: adaptive keepalive (RFC 6298)
 
-This document will detail the complete design, with an immediate, actionable implementation plan for Phase 1.
+## 2. Goals and Non-Goals
 
-## 2. Problem & Motivation
+### Goals
 
-Current lightweight task frameworks (Celery, Sidekiq, etc.) are immensely popular for their ease of use. However, their core architecture—where decoupled workers compete to consume tasks from a broker—is a critical liability in high-load, real-world scenarios.
+- Provide a **single long-lived bidi stream** (`Connect`) for registration, heartbeats/status, and task push from master to worker.
+- Separate **failure detection paths** in logs and behavior: clean close, receive errors, send errors, and application heartbeat timeout.
+- Implement **RFC 6298–style** `SRTT`, `RTTVAR`, and `RTO = SRTT + 4×RTTVAR` to recommend `keepalive` **Time** and **Timeout** on the worker.
+- Support **repeatable experiments** via containerized deployment and optional **network emulation** (`tc netem`) for delay/jitter.
 
-### The Thundering Herd Problem
+### Non-Goals (current codebase)
 
-When a sudden, massive burst of tasks enters the message queue, all available workers will immediately pull and buffer as many tasks as their prefetch limits allow. If the task arrival rate exceeds the cluster's processing capacity, this leads to:
+- **No external task broker** (for example RabbitMQ): tasks are generated inside the optional master task loop or by future producers calling into the scheduler API.
+- **No production-grade master HA**: one logical master process is assumed.
+- **No rich task DAG / cron / priority queues**: task assignment is a minimal envelope (`task_id`, `task_name`, `payload` bytes); worker execution is a stub sleep for demonstration.
 
-- **Memory Exhaustion (OOM):** Workers buffer tasks in memory, leading to OOM kills
-- **Cascading Failure:** Dying workers cause tasks to be re-queued, which are then picked up by other workers, accelerating their failure
-- **High p99 Latency:** Even if the system doesn't crash, task-processing latency becomes erratic and unpredictable
+## 3. Architecture
 
-### The Gap in the Market
-
-Heavyweight solutions like streaming platforms (Flink) or service meshes (Istio) solve this with native backpressure and intelligent routing, but they introduce an enormous amount of operational complexity, making them unsuitable for simple, real-time task dispatching.
-
-**The "sweet spot" is missing:** A lightweight, easy-to-deploy task scheduler that is natively resilient and intelligent. This project aims to design and validate such a system.
-
-## 3. Goals & Non-Goals
-
-### Goals (Overall Project)
-
-- Design and build a Master-Worker scheduler that leverages a global view for flow control and task routing
-- Prove that this architecture is quantifiably more resilient to load spikes than the standard broker-consumer model
-- Implement and evaluate adaptive, intelligence-driven scheduling algorithms (Phase 2)
-
-### Non-Goals (For the 6-Week Phase 1 Sprint)
-
-- **No Dynamic Intelligence:** We will not implement any Phase 2 adaptive algorithms (no latency-awareness, no PID controllers). The goal is to prove the static model first
-- **No Master High-Availability (HA):** The Master will be a single point of failure (SPOF). This is an acceptable trade-off for a prototype focused on validating the scheduling logic
-- **No Feature-Completeness:** We will not implement a full feature set (e.g., cron jobs, task priorities, complex workflows). We are focused purely on the core scheduling/flow-control mechanism
-- **No Monitoring UI:** Observability will be handled via logs and benchmark data, not a web UI (like Flower)
-
-## 4. Proposed Architecture
-
-The system consists of four components:
-
-### Client
-The task producer. It serializes a task and publishes it to the Broker.
-
-### Broker (RabbitMQ)
-The task buffer. It decouples the Client from the scheduler.
-
-### Master (The "Conductor")
-This is the core of our system:
-
-- It is the sole consumer from the Broker, giving it a global view of all incoming tasks
-- It maintains a real-time state of all connected Workers (WorkerStateManager)
-- It implements Macro-Flow Control (Algorithm 1) to protect the entire cluster
-- It implements Micro-Scheduling (Algorithm 2) to push tasks to specific Workers
-
-### Worker (The "Executor")
-
-- It is a "dumb" execution unit. It does not connect to the Broker
-- On startup, it initiates a bi-directional gRPC stream to the Master to register itself
-- It passively waits for the Master to push TaskAssignment messages via the stream
-- It reports heartbeats and StatusUpdate messages back to the Master via the same stream
-
-## 5. Detailed Design & Trade-offs (Phase 1)
-
-### 5.1 Key Trade-off: Master-Consumes vs. Worker-Consumes
-
-This is the central design decision of the entire project and our primary departure from Celery.
-
-#### Celery/Worker-Consumes Model
-Workers connect directly to the Broker and pull tasks.
-
-**Pros:**
-- Simple, decentralized, and naturally load-balanced
-
-**Cons:**
-- No global coordination
-- Highly vulnerable to "thundering herd" overloads, as all workers will pull tasks simultaneously and crash
-
-#### SwiftScheduler/Master-Consumes Model
-The Master is the only component connecting to the Broker.
-
-**Pros:**
-- Enables global flow control
-- The Master can monitor the entire cluster's health and decide to stop consuming from the Broker, creating backpressure at the source and preventing any worker from being overloaded
-
-**Cons:**
-- The Master becomes a potential performance bottleneck and a single point of failure (SPOF)
-
-**Decision:** We choose the Master-Consumes model. Our project's entire hypothesis rests on proving the value of global control and resilience. We accept the trade-off of a centralized bottleneck (a Phase 1 non-goal) to gain this capability.
-
-### 5.2 Communication Protocol (gRPC .proto v1)
-
-We will use gRPC bi-directional streaming for low-latency, persistent communication between the Master and Workers.
-
-```protobuf
-syntax = "proto3";
-
-package scheduler;
-
-// The core service. Workers initiate the connection.
-service SchedulerService {
-  // Bi-directional stream for registration, health/status updates,
-  // and task assignments.
-  rpc Connect(stream WorkerMessage) returns (stream MasterMessage);
-}
-
-// --- Worker -> Master ---
-message WorkerMessage {
-  string worker_id = 1;
-  oneof payload {
-    RegisterRequest register_request = 2; // Sent on startup
-    StatusUpdate status_update = 3;       // Sent on task completion or for heartbeats
-  }
-}
-
-message RegisterRequest {
-  string hostname = 1;
-  int32 max_concurrency = 2; // The max number of tasks this worker can run
-}
-
-message StatusUpdate {
-  int32 active_task_count = 1; // Current number of tasks being processed
-  // In Phase 2, this will be expanded with CPU, p99_latency, etc.
-}
-
-// --- Master -> Worker ---
-message MasterMessage {
-  oneof payload {
-    RegisterResponse register_response = 1; // Confirms registration
-    TaskAssignment task_assignment = 2;   // Pushes a new task to the worker
-  }
-}
-
-message RegisterResponse {
-  bool success = 1;
-  string message = 2;
-}
-
-message TaskAssignment {
-  string task_id = 1;
-  string task_name = 2;
-  bytes task_payload = 3; // The serialized task arguments
-}
+```mermaid
+flowchart LR
+  subgraph worker_proc[Worker process]
+    WKA[gRPC client keepalive]
+    ADP[Adaptive RTT estimator]
+    HB[App heartbeat loop]
+    EXE[Task goroutines]
+  end
+  subgraph master_proc[Master process]
+    SKA[gRPC server keepalive]
+    SM[StateManager]
+    HBS[Heartbeat timeout scan]
+    TG[Optional task generator]
+  end
+  HB -->|StatusUpdate| SM
+  TG -->|TaskAssignment| EXE
+  SM -->|stream Send| TG
+  ADP -->|reconnect with new KA| WKA
 ```
 
-### 5.3 Core Algorithms (Phase 1)
+**Components**
 
-#### Algorithm 1: Macro-Flow Control (Static Backpressure)
+| Piece | Role |
+|--------|------|
+| **`cmd/master`** | gRPC server, `Connect` handler, optional periodic task generator, periodic stats log, heartbeat timeout scanner |
+| **`cmd/worker`** | gRPC client, registration, recv loop for assignments, concurrent task slots (`max_concurrency`), periodic status/heartbeat sends, optional adaptive reconnect |
+| **`internal/scheduler`** | In-memory **global view**: registered workers, last reported `active_task_count`, aggregated load; worker selection and task send hooks used by the master |
+| **`internal/adaptive`** | `RTTEstimator`—RFC 6298 smoothing; `Recommend()` maps estimates to suggested keepalive **Time** / **Timeout** with clamps |
+| **`proto/scheduler.proto`** | Messages and `SchedulerService.Connect` stream contract |
 
-**Goal:** Protect the entire cluster from overload.
+## 4. Protocol (`proto/scheduler.proto`)
 
-**Implementation:** The Master maintains a GlobalActiveTasks (sum of all active_task_count from all workers) and a GlobalMaxCapacity (sum of all max_concurrency).
+Workers initiate **one** bidi stream:
 
-**Static Threshold:** We will define a hardcoded high-watermark, e.g., HIGH_WATERMARK = 0.8 (80% capacity).
+- `rpc Connect(stream WorkerMessage) returns (stream MasterMessage);`
 
-**Control Loop (in Master's RMQ Consumer):**
+**Worker → master**
 
-```go
-// Pseudocode for the Master's consumer loop
-for {
-    currentLoad := stateManager.GetGlobalActiveTasks() / 
-                   stateManager.GetGlobalMaxCapacity()
+- First message **must** be `RegisterRequest` (`hostname`, `max_concurrency`) inside `WorkerMessage` with a stable `worker_id`.
+- Later messages are `StatusUpdate` (`active_task_count`) for heartbeats and load reporting.
 
-    if currentLoad >= HIGH_WATERMARK {
-        // Load is too high. Apply backpressure.
-        // Stop consuming from RabbitMQ.
-        rabbitConsumer.Pause()
-        // Log that backpressure is active.
-        time.Sleep(1 * time.Second) // Wait for the cluster to recover
-    } else {
-        // Load is acceptable. Resume consumption.
-        rabbitConsumer.Resume()
-        taskMsg := rabbitConsumer.Poll()
-        if taskMsg != nil {
-            schedule(taskMsg) // Send to Algorithm 2
-        }
-    }
-}
-```
+**Master → worker**
 
-#### Algorithm 2: Micro-Scheduling (Capacity-Aware Round-Robin)
+- `RegisterResponse` after registration.
+- `TaskAssignment` (`task_id`, `task_name`, `task_payload`).
 
-**Goal:** Distribute tasks fairly to available workers.
+## 5. Connection and Session Lifecycle
 
-**Implementation:** The Master will not do a simple round-robin. It will perform a round-robin only on the subset of workers that are currently not at full capacity (i.e., active_task_count < max_concurrency). If all workers are at capacity, the task will wait in the Master's internal memory (briefly, as the flow control loop should have already paused consumption).
+### Master (`Connect`)
 
-## 6. Testing & Validation Plan (Phase 1)
+1. Accept stream; require first message to be registration; register worker with `StateManager` (including the server stream for downstream sends).
+2. Send successful `RegisterResponse`.
+3. Loop on `Recv()`:
+   - `io.EOF` → log `[Detect] ... type=EOF`.
+   - Other errors → log `[Detect] ... type=RECV_ERR`.
+   - `StatusUpdate` → update worker state (and heartbeat freshness where implemented).
+4. `defer` unregister worker on handler exit.
 
-### Control Group (Baseline)
-A "Celery-like" model. We will write a simple Go script that launches N separate processes, each acting as an independent consumer pulling tasks directly from RabbitMQ.
+### Worker (`runWorkerSession`)
 
-### Experimental Group (Candidate)
-Our Phase 1 Master-Worker system with N workers.
+1. `Dial` master with **client** keepalive parameters (env-tunable).
+2. Open `Connect` stream; send `RegisterRequest`.
+3. **Recv loop** (goroutine): handle `RegisterResponse` and `TaskAssignment`.
+   - Each assignment increments concurrency (semaphore), updates `active_task_count`, sends status on start/finish; demo work is `time.Sleep(3s)`.
+   - Stream errors / EOF logged with `[Detect]` on the worker side.
+4. **Main loop**: ticker-driven `StatusUpdate` sends (application heartbeat). Failed `Send` → `[Detect] type=SEND_ERR`.
+5. If **adaptive** mode is enabled, inter-send timing feeds the estimator; after enough samples and a reconnect interval, session may return **new** keepalive params; outer loop reconnects with updated `grpc.WithKeepaliveParams`.
 
-### Test Scenario: "Thundering Herd" (Resilience Test)
+## 6. Failure Detection Model
 
-**Load:** A load generator script will publish 10,000 tasks (each simulating 500ms of work) to RabbitMQ in under 1 second.
+The implementation distinguishes paths deliberately:
 
-### Metrics
+| Tag | Where observed | Typical cause |
+|-----|----------------|---------------|
+| **EOF** | Master or worker | Clean stream close |
+| **RECV_ERR** | Master (`Recv` error) | Abnormal stream termination on read |
+| **ERR** | Worker recv loop | Peer reset / protocol error |
+| **SEND_ERR** | Worker | Cannot write status (backpressure, reset, freeze) |
+| **HB_TIMEOUT** | Master (scanner) | No fresh status within `MASTER_HB_TIMEOUT` |
 
-- **System Stability (Primary):** Do the worker processes crash (OOM)? Does the system recover?
-- **Throughput Curve:** A graph of completed tasks over time
-- **Resource Usage:** CPU and Memory graphs for the worker processes
+**Why this matters:** Crashes often surface as **transport errors** quickly. Freezes may leave TCP **open**; **application heartbeats** plus **keepalive** define how long silence is tolerated before declaring the worker dead.
 
-### Expected Outcome (for the report)
-We will show a graph where the Baseline workers' memory usage spikes and the processes crash. In contrast, the Candidate (our system) workers' memory will remain stable, and the throughput curve will be a clean, steady line as it processes tasks at its maximum controlled capacity. 
+## 7. Keepalive: Two Layers
 
-**Conclusion:** Phase 1's global view provides quantifiable, superior resilience.
+### 7.1 gRPC keepalive (transport)
 
-## 7. Milestones (6-Week Sprint: Oct 21 - Nov 30)
+**Master** uses `grpc.KeepaliveParams` and `grpc.KeepaliveEnforcementPolicy` (notably `MinTime` so clients may ping at least every 1s when tuning aggressively).
 
-- **Week 1 (Oct 21-26):** Finalize this Design Doc. Set up project skeleton (Go modules), Git repo. Define and generate .proto v1 code.
+**Worker** uses `grpc.WithKeepaliveParams` with env defaults (`WORKER_KA_TIME`, `WORKER_KA_TIMEOUT`).
 
-- **Week 2 (Oct 27-Nov 2):** Implement baseline gRPC Connect stream between Master and Worker. Implement Worker RegisterRequest logic.
+These settings affect **HTTP/2 PING** behavior and help detect **some** dead connections, but are not a substitute for application-level progress signals when the process is alive-but-stuck.
 
-- **Week 3 (Nov 3-Nov 9):** Implement Master's WorkerStateManager (for registration, heartbeats). Implement Master's basic RabbitMQ consumer loop.
+### 7.2 Application heartbeat + master scan
 
-- **Week 4 (Oct 10-Nov 16):** Implement Core Loop: Master can TaskAssignment -> Worker, Worker executes (simulated) and reports StatusUpdate (with active_task_count).
+The worker sends `StatusUpdate` on an interval (`WORKER_HEARTBEAT`, default 2s). The master runs `MASTER_HB_SCAN` (default 200ms) and marks workers stale beyond `MASTER_HB_TIMEOUT` (default 6s in code; compose file may override, e.g. 15s).
 
-- **Week 5 (Nov 17-Nov 23):** Implement Core Innovation: Implement Algorithm 1 (Static Backpressure). Build the Baseline script and the Thundering Herd load generator. Run all experiments and collect data/graphs.
+**Semantics in tests:** `StateManager` may treat a worker as **suspected** after timeout to **deduplicate** repeated timeout logs until a new `StatusUpdate` clears the flag.
 
-- **Week 6 (Nov 24-Nov 30):** Analyze data. Write the final report and create the presentation slides. Rehearse.
+## 8. Adaptive Keepalive (`internal/adaptive`)
 
-## 8. Future Work (Phase 2)
+### 8.1 Estimator
 
-Upon the successful validation of the Phase 1 framework, Phase 2 will inject dynamic intelligence. The HealthReport message will be expanded to include CPU, I/O, and p99 latency metrics. The Master's static algorithms will be replaced with:
+`RTTEstimator` implements RFC 6298-style updates:
 
-### Path A (Intelligent Load Definition)
-A multi-dimensional "health score" will be calculated for each worker.
+- First sample initializes `SRTT` and `RTTVAR`.
+- Later samples: update `RTTVAR` with `β`, then `SRTT` with `α` (constants match RFC recommendations).
 
-### Path B (Dynamic & Adaptive Thresholds)
-The Micro-Scheduler (Algorithm 2) will be upgraded to route tasks to the worker with the best health score. The Macro-Flow Controller (Algorithm 1) will be upgraded to use a PID controller to dynamically adjust consumption, targeting an optimal cluster load.
+`RTO()` returns `SRTT + 4×RTTVAR`, clamped to `[1s, 30s]` for keepalive timeout use.
 
-## 9. Alternatives Considered
+### 8.2 Recommendation mapping
 
-### Alternative: Use Celery + Kubernetes HPA
+`Recommend()` sets:
 
-**Why not?** HPA is reactive and slow (minute-scale), designed to solve scale. Our problem is proactive and instantaneous (millisecond-scale), designed to solve overload. HPA cannot prevent workers from crashing in the first 30 seconds of a load spike.
+- **`KATimeout`** ← `RTO()` (same structural role as retransmission timeout).
+- **`KATime`** ← `3×SRTT` (clamped to `[1s, 60s]`), with the invariant **`KATime > KATimeout`** so a ping period does not finish before the prior deadline.
 
-### Alternative: Decentralized Control (Workers coordinate)
+**Sample source in the worker:** elapsed time between **successful** periodic status sends proxies “RTT-like” timing (including scheduling jitter under load—not a pure network RTT). That is intentional: the goal is to tune **how long we wait before concluding silence is failure** under **observed** send pacing.
 
-**Why not?** Requires complex gossip protocols for workers to share state. A centralized Master is a simpler, more deterministic, and more powerful model for achieving a true global view. The SPOF trade-off is acceptable for this project's goals.
+### 8.3 Applying recommendations
+
+Controlled by `WORKER_ADAPTIVE_ENABLED`, `WORKER_ADAPTIVE_RECONNECT_EVERY`, `WORKER_ADAPTIVE_MIN_SAMPLES`, `WORKER_ADAPTIVE_MIN_DELTA`. Reconfiguration only occurs when the suggested params differ from the current ones by at least `min_delta`, reducing thrash.
+
+## Design Alternatives
+
+### Static Keepalive
+- simple
+- poor under jitter
+
+### Adaptive Keepalive (this project)
+- responsive to environment
+- slightly more complex
+
+## 9. Scheduling and Global Load
+
+The **`StateManager`** maintains a **global view**:
+
+- Per worker: `max_concurrency`, `active_task_count` (from status updates).
+- **Aggregate:** `GetGlobalLoad()` → sum of active tasks and sum of capacities.
+
+**Worker selection** (used by the optional task generator and covered by unit tests): prefer the worker with **lowest** `active_task_count` subject to spare capacity; errors if no worker is available.
+
+**Optional task generator** (`MASTER_ENABLE_TASKGEN=1`): batches assignments on `MASTER_TASK_TICK` / `MASTER_TASK_BATCH` for stress or demo—**not** a broker-backed pipeline.
+
+**Repository alignment:** `cmd/master` and `internal/scheduler/state_test.go` assume a `StateManager` that also holds **per-worker send streams**, exposes **least-load selection**, **timeout scanning** with deduplication, and **outbound task send**. The minimal `state.go` in the tree implements registration, status updates, and `GetGlobalLoad`; completing the methods and fields expected by the master and tests is required for a clean `go build ./...`.
+
+## 10. Configuration Reference (Environment)
+
+**Master**
+
+| Variable | Purpose |
+|----------|---------|
+| `MASTER_LISTEN_ADDR` | Listen address (default `:50051`) |
+| `MASTER_KA_TIME` / `MASTER_KA_TIMEOUT` | Server keepalive |
+| `MASTER_HB_TIMEOUT` / `MASTER_HB_SCAN` | App heartbeat deadline and scan period |
+| `MASTER_ENABLE_TASKGEN` | Enable built-in generator (`1`) |
+| `MASTER_TASK_TICK` / `MASTER_TASK_BATCH` | Generator timing and batch size |
+
+**Worker**
+
+| Variable | Purpose |
+|----------|---------|
+| `MASTER_ADDR` | Master dial target |
+| `WORKER_KA_TIME` / `WORKER_KA_TIMEOUT` | Initial client keepalive |
+| `WORKER_HEARTBEAT` | Status send interval |
+| `WORKER_MAX_CONCURRENCY` | Task slots |
+| `WORKER_RECONNECT_BACKOFF` | Delay between sessions |
+| `WORKER_ADAPTIVE_*` | Adaptive mode, samples, reconnect interval, min delta |
+
+## 11. Deployment and Experiments
+
+- **`docker compose up --build`** builds a two-stage image (Go 1.24 builder, slim runtime with `iproute2` for `tc`).
+- **Worker** may run an entrypoint wrapper that applies **`tc netem`** delay/jitter when `DELAY_MS` / `JITTER_MS` are set; `NET_ADMIN` capability is included for that path.
+- Defaults in compose slow the task generator for quieter logs vs. binary defaults.
+
+## 12. Testing
+
+- **`internal/adaptive`:** Estimator convergence, bounds on recommendations, initial RTO without samples.
+- **`internal/scheduler`:** Least-load `SelectWorker`, heartbeat timeout deduplication, status update clearing suspected state.
+
+## 13. Observed Tradeoffs (from experiments)
+
+Documented in `README.md`: crash-style failures are detected quickly (~100–200 ms in cited runs); **freeze** detection without adaptation can be on the order of many seconds (keepalive + heartbeat stack); adaptive tuning **reduces** freeze detection latency under unstable conditions at the cost of more sensitivity to timing noise (possible false positives if parameters are too aggressive).
+
+## Limitations
+
+- Uses status-send timing as RTT proxy
+- Sensitive to CPU scheduling delay
+- Requires reconnect to apply new parameters
+
+## 14. Future Work
+
+- Richer **health signals** in `StatusUpdate` (CPU, queue depth, latency percentiles) for scheduling beyond least-load.
+- **Broker-integrated** ingest with **macro backpressure** (master as sole consumer) as a separate scale/resilience track—orthogonal to keepalive tuning but compatible with the same master–worker stream.
+- **Formal evaluation** harness (replayable traces, CPU pinning, freeze injection) checked into `scripts/` for CI or one-command reproduction.
+
+## 15. Related Documentation
+
+- **README.md** — quick start, detection taxonomy table, example latencies.
+- **RFC 6298** — [https://www.rfc-editor.org/rfc/rfc6298](https://www.rfc-editor.org/rfc/rfc6298)
