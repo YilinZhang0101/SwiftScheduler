@@ -3,6 +3,7 @@ package scheduler
 import (
 	"log"
 	"sync" // sync for mutexes
+	"errors"
 
 	pb "github.com/YilinZhang0101/SwiftScheduler/proto" // module path
 )
@@ -16,6 +17,7 @@ type WorkerStats struct {
 	// --- Core load metric for Phase 1 ---
 	ActiveTaskCount int32
 	// TODO: In Phase 2, expand to a richer health score
+	Stream pb.SchedulerService_ConnectServer
 }
 
 // StateManager manages all workers' state.
@@ -34,7 +36,7 @@ func NewStateManager() *StateManager {
 }
 
 // RegisterWorker is called when a worker connects
-func (sm *StateManager) RegisterWorker(req *pb.RegisterRequest, workerID string) {
+func (sm *StateManager) RegisterWorker(req *pb.RegisterRequest, workerID string, stream pb.SchedulerService_ConnectServer) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
@@ -43,6 +45,7 @@ func (sm *StateManager) RegisterWorker(req *pb.RegisterRequest, workerID string)
 		Hostname:        req.Hostname,
 		MaxConcurrency:  req.MaxConcurrency,
 		ActiveTaskCount: 0, // newly registered worker starts with 0 active tasks
+		Stream:          stream, // store the data stream
 	}
 	sm.workers[workerID] = stats
 
@@ -68,6 +71,35 @@ func (sm *StateManager) UpdateWorkerStatus(workerID string, update *pb.StatusUpd
 		return
 	}
 	log.Printf("[StateManager] Received status for unknown worker: %s", workerID)
+}
+
+// SelectWorker finds the best available Worker
+// Strategy: Least Load (select the worker with the least active tasks and not at full capacity)
+func (sm *StateManager) SelectWorker() (string, pb.SchedulerService_ConnectServer, error) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	var bestWorker *WorkerStats
+	minLoad := int32(1<<31 - 1) // Max Int32
+
+	for _, worker := range sm.workers {
+		// 1. check if there is capacity
+		if worker.ActiveTaskCount >= worker.MaxConcurrency {
+			continue
+		}
+
+		// 2. find the worker with the least load
+		if worker.ActiveTaskCount < minLoad {
+			minLoad = worker.ActiveTaskCount
+			bestWorker = worker
+		}
+	}
+
+	if bestWorker == nil {
+		return "", nil, errors.New("no available workers found")
+	}
+
+	return bestWorker.ID, bestWorker.Stream, nil
 }
 
 // GetGlobalLoad returns (sumActive, sumCapacity)
